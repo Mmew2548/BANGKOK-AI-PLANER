@@ -30,11 +30,12 @@ GEMINI_VAR_USED = next((n for n in GEMINI_VARS if _env(n)), "")
 GEMINI_MODELS = [m.strip() for m in (_env("GEMINI_MODEL") or gh.DEFAULT_MODEL).split(",") if m.strip()]
 GEMINI_MODEL = GEMINI_MODELS[0]
 MAX_STOPS = 8
+WALK_MAX_KM = 0.5      # ระยะที่ถือว่า "เดินได้" (กม.) = 500 เมตร
 AUTO_ORDER = True      # True = พิมพ์ในแชทตั้งแต่ 3 จุดขึ้นไป ให้ Gemini ช่วยจัดลำดับว่าไปที่ไหนก่อน-หลังให้อัตโนมัติ
 AUTO_PLAN_DISCOVER = False  # False = แนะนำอย่างเดียว ใช้แค่คีย์ Gemini (ใส่รายชื่อในช่อง "จุดแวะ" ให้กดแสดงเส้นทางเอง)
                             # True = แนะนำเสร็จแล้วคำนวณเส้นทางให้เลย (ต้องใช้ GOOGLE_MAPS_API_KEY และกินโควต้า Google)
 CHAT_ON_RIGHT = True   # True = แชทอยู่ขวา แผนที่อยู่ซ้าย / False = แชทอยู่ซ้ายเหมือนเดิม
-CHAT_H = 560           # ความสูงกล่องแชท (px)
+CHAT_H = 640           # ความสูงกล่องแชท (px)
 MAP_H = 430            # ความสูงแผนที่ (px)
 IMAGES_PER_PLACE = 4   # จำนวนรูปสถานที่จาก Wikipedia ต่อ 1 ที่ (แสดงในแชท)
 AI_ALL_TRANSIT = True  # True = ให้ Gemini คำนวณราคาทุกช่วง (รถเมล์ + รถไฟ/รถไฟฟ้า) ถ้า Gemini ตอบไม่ได้ค่อยใช้ราคาจากตาราง fares.py
@@ -63,10 +64,10 @@ st.markdown(f"""
 html, body, .stApp, .stApp *:not([data-testid="stIconMaterial"]):not(.material-icons):not(.material-symbols-rounded) {{font-family:{FONT_STACK} !important}}
 :root {{--bgimg:url("{BG}")}}
 header, footer {{visibility:hidden}}
-.nav {{background:rgba(40,50,80,.85);color:#fff;border-radius:40px;padding:12px 28px;
- display:flex;align-items:center;gap:16px;margin-bottom:12px;font-size:18px}}
-.nav .logo-img {{height:64px;width:auto;display:block;border-radius:10px}}
-.nav .t1 {{font-size:26px;font-weight:700;letter-spacing:1px;line-height:1.2;font-family:'Hack',monospace !important}}
+.nav {{background:rgba(40,50,80,.85);color:#fff;border-radius:30px;padding:6px 22px;
+ display:flex;align-items:center;gap:12px;margin-bottom:12px;font-size:16px}}
+.nav .logo-img {{height:38px;width:auto;display:block;border-radius:10px}}
+.nav .t1 {{font-size:20px;font-weight:700;letter-spacing:1px;line-height:1.2;font-family:'Hack',monospace !important}}
 .stButton>button {{border-radius:40px;border:2px solid #000;font-weight:700}}
 .stTextInput input, .stTextArea textarea {{border-radius:20px;border:2px solid #000}}
 .box {{border:2px solid #000;border-radius:24px;padding:6px 18px;background:#fff}}
@@ -124,6 +125,14 @@ def gemini_try(fn):
             last = e
             print(f"[gemini] รุ่น {m} ใช้ไม่ได้: {e}", flush=True)
     raise last
+
+
+def thai_fix(t):
+    """รวมสระอำที่ถูกแยกเป็น นิคหิต(ํ)+า ให้เป็น ำ (เช่น น้ำ) ไม่งั้นฟอนต์แสดงเป็นตัวเพี้ยน"""
+    if not isinstance(t, str):
+        return t
+    t = re.sub("\u0e4d([\u0e48-\u0e4b]?)\u0e32", lambda m: m.group(1) + "\u0e33", t)
+    return re.sub("([\u0e48-\u0e4b])\u0e4d\u0e32", lambda m: m.group(1) + "\u0e33", t)
 
 
 def is_quota_error(e):
@@ -441,16 +450,22 @@ def stop_names(inf):
     return dn, an
 
 
-def parse_transit(tr, ai=None):
+def parse_transit(tr, ai=None, dest=None):
     ai = ai or {}
     lines, stations, total, unknown, ai_used = [], [], 0, False, False
+    walk_m, seen = 0, False
     for s_ in tr["steps"]:
         inf = step_info(s_)
         if not inf:
+            if s_.get("travelMode") == "WALK":
+                walk_m += s_.get("distanceMeters", 0)
             continue
         f, est, price = fare_of(inf, ai)
         total += f or 0; unknown |= f is None; ai_used |= est
         dn, an = stop_names(inf)
+        if walk_m >= 100:                            # เดินไปจุดขึ้น
+            lines.append(f"- 🚶 เดิน ~{walk_m:.0f} ม. ไปที่ **{dn}**")
+        walk_m, seen = 0, True
         lbl = "รถไฟไทย (รฟท.)" if inf["srt"] else inf["label"]
         lines.append(f"- {inf['icon']} **{lbl}** {inf['name']}: "
                      f"ขึ้น **{dn}** → ลง **{an}** ({inf['n']} {inf['unit']}) " + price)
@@ -458,6 +473,8 @@ def parse_transit(tr, ai=None):
             loc = (st_.get("location") or {}).get("latLng")
             if loc:
                 stations.append({"name": f"{kind}: {st_.get('name', '')}", "lon": loc["longitude"], "lat": loc["latitude"]})
+    if seen and walk_m >= 100 and dest:              # เดินต่อจากจุดลงไปปลายทาง
+        lines.append(f"- 🚶 เดินต่อ ~{walk_m:.0f} ม. ไปที่ **{dest}**")
     return lines, stations, total, unknown, ai_used
 
 
@@ -556,17 +573,21 @@ def plan_leg(o, d, res, ai=None):
            "moto": fares.motorcycle_fare(km), "taxi": fares.taxi_fare(km, jam, airport)}
     if tr:
         ss.debug = tr["raw"]
-        lines, stations, total, unknown, ai_used = parse_transit(tr, ai)
+        lines, stations, total, unknown, ai_used = parse_transit(tr, ai, d)
         if lines:
             leg.update(has_transit=True, lines=lines, stations=stations, transit_total=total,
                        unknown=unknown, transit_mins=tr["mins"], ai=ai_used)
             if tr.get("poly"):
                 leg["paths"] = [decode_polyline(tr["poly"])]
+    wk = res.get((o, d, "WALK"))                     # เดินได้ถ้าไม่เกิน WALK_MAX_KM
+    leg["walk"] = None
+    if isinstance(wk, dict) and "error" not in wk and wk["km"] <= WALK_MAX_KM:
+        leg["walk"] = {"km": wk["km"], "mins": wk["mins"]}
     leg["rail"] = None                               # ทางเลือกรถไฟ/รถไฟฟ้าล้วน (ไม่ใช้รถเมล์) แสดงควบคู่กับเส้นทางหลัก
     rl = res.get((o, d, "RAIL"))
     ks = lambda t: [(step_info(x) or {}).get("key") for x in ((t or {}).get("steps") or []) if x.get("transitDetails")]
     if isinstance(rl, dict) and "error" not in rl and rl.get("steps") and ks(rl) and ks(rl) != ks(tr):
-        rlines, rstations, rtotal, runknown, rai = parse_transit(rl, ai)
+        rlines, rstations, rtotal, runknown, rai = parse_transit(rl, ai, d)
         if rlines:
             leg["rail"] = {"lines": rlines, "stations": rstations, "total": rtotal, "unknown": runknown,
                            "ai": rai, "mins": rl["mins"]}
@@ -574,32 +595,15 @@ def plan_leg(o, d, res, ai=None):
     srt = res.get((o, d, "SRT"))
     leg["srt_stations"] = []
     if isinstance(srt, dict) and "error" not in srt and srt.get("steps"):
-        leg["srt_stations"] = parse_transit(srt, ai)[1]
+        leg["srt_stations"] = parse_transit(srt, ai, d)[1]
     leg["modes"] = collect_modes([tr, rl, srt], ai)
-    leg["near_srt"] = None
-    if "srt" not in leg["modes"]:                    # Google ไม่มีเส้นทางรถไฟไทย -> บอกสถานีรถไฟที่ใกล้จุดขึ้น/ลงแทน
-        store = _near_store()
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            a, b = ex.map(lambda p: near_srt_stations(p, store), (leg["start"], leg["end"]))
-        leg["near_srt"] = (a, b)
     return leg
 
 
 def mode_lines(leg):
-    """บรรทัด Markdown ของ "ขึ้นอะไรได้บ้าง" ของช่วงนี้ (ขึ้นต้นด้วย '  - ' เป็นรายการย่อย)"""
+    """แสดงเฉพาะพาหนะที่ Google พบเส้นทางจริง"""
     modes = leg.get("modes") or {}
-    rows = []
-    for cat, icon, nm in MODE_ORDER:
-        if cat in modes:
-            rows.append(f"  - {icon} **{nm}** {modes[cat]}")
-        elif cat == "srt" and leg.get("near_srt"):
-            a, b = leg["near_srt"]
-            rows.append(f"  - {icon} **{nm}**: _ไม่พบเส้นทางตรงช่วงนี้_ · "
-                        + (f"สถานีรถไฟใกล้จุดขึ้น: {', '.join(a)}" if a else "ไม่พบสถานีรถไฟใกล้จุดขึ้น") + " · "
-                        + (f"ใกล้จุดลง: {', '.join(b)}" if b else "ไม่พบสถานีรถไฟใกล้จุดลง"))
-        else:
-            rows.append(f"  - {icon} **{nm}**: _ไม่พบเส้นทางช่วงนี้_")
-    return rows
+    return [f"  - {icon} **{nm}** {modes[cat]}" for cat, icon, nm in MODE_ORDER if cat in modes]
 
 
 def plan_trip(stops):
@@ -611,7 +615,7 @@ def plan_trip(stops):
         return "ต้องมีอย่างน้อย 2 จุด (ต้นทางและปลายทาง)"
     stops = stops[:MAX_STOPS]
     print(f"[plan_trip] เริ่มวางแผน {stops}", flush=True)
-    pairs = [(stops[i], stops[i + 1], m) for i in range(len(stops) - 1) for m in ("DRIVE", "TRANSIT", "RAIL", "SRT")]
+    pairs = [(stops[i], stops[i + 1], m) for i in range(len(stops) - 1) for m in ("DRIVE", "TRANSIT", "RAIL", "SRT", "WALK")]
     ex = ThreadPoolExecutor(max_workers=8)
     futs = {k: ex.submit(g_route, k[0], k[1], k[2], GKEY) for k in pairs}
     wait(list(futs.values()), timeout=45)            # รอรวมไม่เกิน 45 วินาที
@@ -647,10 +651,14 @@ def plan_trip(stops):
             if st_ not in ss.stations:
                 ss.stations.append(st_)
         out.append(f"### ช่วงที่ {i+1}: {leg['o']} → {leg['d']}")
-        out.append(f"ขับรถ {leg['km']:.1f} กม. ({leg['mins']:.0f} นาที)")
+        out.append(f"ระยะทางประมาณ {leg['km']:.1f} กม.")
         gm = ("https://www.google.com/maps/dir/?api=1&origin=" + quote(with_bkk(leg["o"])) +
               "&destination=" + quote(with_bkk(leg["d"])) + "&travelmode=transit")
         out.append(f"[🔗 เปิดช่วงนี้ใน Google Maps]({gm})")
+        if leg.get("walk"):                          # ระยะใกล้ เดินได้
+            w = leg["walk"]
+            dist = f"{w['km'] * 1000:.0f} ม." if w["km"] < 1 else f"{w['km']:.1f} กม."
+            out.append(f"- 🚶 **เดินได้**: {leg['o']} → {leg['d']} ≈ {dist} · {w['mins']:.0f} นาที")
         if leg["has_transit"]:
             out += leg["lines"]
             if leg["transit_total"]:
@@ -660,26 +668,25 @@ def plan_trip(stops):
             else:
                 out.append(f"- ⏱️ ขนส่งสาธารณะ {leg['transit_mins']:.0f} นาที")
             tot_tr += leg["transit_total"]; any_ai |= leg["ai"]
-        else:
-            out.append("- ไม่พบเส้นทางขนส่งสาธารณะ (แผนที่แสดงเส้นทางขับรถ)")
-        if leg.get("rail"):                          # ทางเลือกรถไฟไทย (รฟท.) แยกชื่อสถานีรถไฟ
+        if leg.get("rail"):
             rl = leg["rail"]
             out.append("- 🚆 **ทางเลือกรถไฟ/รถไฟฟ้า (ไม่ใช้รถเมล์)**")
             out += ["  " + x for x in rl["lines"]]
             rnotes = (["รวมราคาที่ Gemini ประมาณ"] if rl["ai"] else []) + (["เฉพาะช่วงที่ทราบราคา"] if rl["unknown"] else [])
             if rl["total"]:
-                out.append(f"  - 💳 รถไฟ/รถไฟฟ้ารวม ≈ **{rl['total']} บาท**"
+                out.append(f"  - 💳 รวม ≈ **{rl['total']} บาท**"
                            f"{' (' + ', '.join(rnotes) + ')' if rnotes else ''} · {rl['mins']:.0f} นาที")
             else:
-                out.append(f"  - ⏱️ รถไฟ/รถไฟฟ้า {rl['mins']:.0f} นาที")
+                out.append(f"  - ⏱️ {rl['mins']:.0f} นาที")
             for st_ in rl["stations"]:
                 if st_ not in ss.stations:
                     ss.stations.append(st_)
-        leg["mode_lines"] = mode_lines(leg)          # สรุปว่าช่วงนี้ขึ้นรถเมล์/BTS/MRT/ARL/รถไฟไทยได้ไหม
-        out.append("- 🚏 **ขึ้นอะไรได้บ้างในช่วงนี้**")
-        out += leg["mode_lines"]
-        out.append(f"- 🛵 วิน ≈ **{leg['moto']} บาท** · 🚕 แท็กซี่ ≈ **{leg['taxi']} บาท**"
-                   f"{' (รวมค่าบริการสนามบิน)' if leg['airport'] else ''}\n")
+        leg["mode_lines"] = mode_lines(leg)
+        if leg["mode_lines"]:                        # สรุปเฉพาะพาหนะที่พบจริง
+            out.append("- 🚏 **ขึ้นได้ด้วย**")
+            out += leg["mode_lines"]
+        out.append(f"- 🛵 วิน ≈ **{leg['moto']} บาท**")
+        out.append(f"- 🚕 แท็กซี่ ≈ **{leg['taxi']} บาท**{' (รวมค่าบริการสนามบิน)' if leg['airport'] else ''}\n")
         tot_km += leg["km"]; tot_min += leg["mins"]; tot_moto += leg["moto"]; tot_taxi += leg["taxi"]
     if ss.legs:
         out += ["---", "### 💰 สรุปทั้งทริป",
@@ -768,7 +775,7 @@ def handle_discover(q):
         icon = KIND_ICON.get(p.get("kind"), "📍")
         stay = f" · ใช้เวลา ~{p['stay_min']} นาที" if isinstance(p.get("stay_min"), (int, float)) else ""
         out.append(f"{i}. {icon} **{p['name']}** — {p.get('why', '')}{stay}")
-    names = [str(p["name"]).strip() for p in places]
+    names = [thai_fix(str(p["name"]).strip()) for p in places]
     if AUTO_PLAN_DISCOVER:
         # fixed_start=False = ให้ Gemini เลือกจุดเริ่มต้นเองด้วย (ลำดับเที่ยวด้านล่างอาจต่างจากรายชื่อด้านบน)
         return "\n".join(out) + "\n\n---\n\n" + run_plan(names, reorder=True, fixed_start=False)
@@ -915,7 +922,7 @@ def new_reply(content):
     """สร้างข้อความตอบกลับ ถ้าเพิ่งวางแผนเสร็จ ให้แนบรูปสถานที่ไปด้วย"""
     places = ss.get("fresh_places") or []
     ss.fresh_places = []
-    msg = {"role": "assistant", "content": content}
+    msg = {"role": "assistant", "content": thai_fix(content)}
     if places:
         try:
             msg["images"] = fetch_place_images(places)
@@ -1027,7 +1034,8 @@ if ss.page == "home":
 st.markdown("""<style>
 .stApp {background:linear-gradient(rgba(8,12,38,.30),rgba(8,12,38,.58)),var(--bgimg) center 35%/cover no-repeat fixed !important}
 [data-testid="stAppViewContainer"], [data-testid="stMain"] {background:transparent !important}
-.block-container, [data-testid="stMainBlockContainer"] {padding:14px 3vw 1.2rem !important;max-width:100% !important}
+.block-container, [data-testid="stMainBlockContainer"] {padding:14px 3% 1.2rem !important;max-width:100% !important}
+[data-testid="stMain"] {scrollbar-gutter:stable both-edges}   /* จองที่แถบเลื่อนให้เท่ากันทั้งซ้ายขวา ขอบจะได้สมมาตร */
 
 /* ตัวอักษรสีสว่างทั้งหน้า */
 .stApp [data-testid="stMarkdownContainer"] *:not(a), .stApp label, .stApp label *, .stApp summary, .stApp summary *,
@@ -1036,10 +1044,10 @@ st.markdown("""<style>
 
 /* แถบหัวเว็บ (ไม่มีเมนู) */
 .topbar {background:rgba(30,40,85,.6);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
- border:1px solid rgba(255,255,255,.16);border-radius:40px;padding:12px 30px;margin:0 0 18px;
- display:flex;align-items:center;gap:16px;box-shadow:0 8px 30px rgba(0,0,0,.3)}
-.topbar .logo-img {height:64px;width:auto;display:block;border-radius:10px}
-.topbar .t1 {font-size:26px;font-weight:700;letter-spacing:1px;line-height:1.2;font-family:'Hack',monospace !important}
+ border:1px solid rgba(255,255,255,.16);border-radius:30px;padding:6px 24px;margin:0 0 10px;
+ display:flex;align-items:center;gap:12px;box-shadow:0 8px 30px rgba(0,0,0,.3)}
+.topbar .logo-img {height:38px;width:auto;display:block;border-radius:10px}
+.topbar .t1 {font-size:20px;font-weight:700;letter-spacing:1px;line-height:1.2;font-family:'Hack',monospace !important}
 
 /* การ์ดซ้าย / แผงขวา */
 .st-key-leftcard, .st-key-rightpanel {background:rgba(30,40,85,.55);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
@@ -1047,10 +1055,10 @@ st.markdown("""<style>
 .st-key-leftcard {padding:22px 26px}
 .st-key-rightpanel {padding:0 0 18px;overflow:hidden}
 .st-key-rightbody {padding:8px 24px 0}
-.panel-head {display:flex;justify-content:space-between;align-items:center;padding:18px 28px;font-size:22px;font-weight:700;
+.panel-head {display:flex;justify-content:space-between;align-items:center;padding:10px 24px;font-size:18px;font-weight:700;
  border-bottom:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.04)}
 .panel-head .ph-title {display:flex;align-items:center;gap:12px;font-family:'Hack',monospace !important;letter-spacing:1px}
-.panel-head .ph-logo {height:46px;width:auto;border-radius:8px}
+.panel-head .ph-logo {height:34px;width:auto;border-radius:8px}
 .panel-head .plane {font-size:24px;opacity:.9}
 
 /* ปุ่ม */
@@ -1147,7 +1155,7 @@ def wiki_summary(lang, title):
 
 
 def trim(t, n=150):
-    t = (t or "").strip()
+    t = thai_fix((t or "").strip())
     return t if len(t) <= n else t[:n] + "…"
 
 
@@ -1230,9 +1238,9 @@ VIEW_CHAT, VIEW_PLACE = "💬 แชท", "📍 รายละเอียด�
 ss.setdefault("view", VIEW_CHAT)
 
 if CHAT_ON_RIGHT:
-    map_col, chat_col = st.columns([1.2, 1], gap="large")
+    map_col, chat_col = st.columns([1.05, 1], gap="medium")
 else:
-    chat_col, map_col = st.columns([1, 1.2], gap="large")
+    chat_col, map_col = st.columns([1, 1.05], gap="medium")
 
 # หมายเหตุ: ต้องวาดฝั่งแชทก่อนฝั่งซ้าย เพราะการตอบแชทอาจแก้ ss.stops_text / ss.legs ก่อนที่ช่อง "จุดแวะ" และแผนที่จะถูกสร้าง
 with chat_col:
@@ -1245,7 +1253,7 @@ with chat_col:
                 box = st.container(height=CHAT_H)
                 for m in ss.msgs:
                     with box.chat_message(m["role"]):
-                        st.markdown(m["content"])
+                        st.markdown(thai_fix(m["content"]))
                         if m.get("images"):          # รูปสถานที่จาก Wikipedia
                             render_images(m["images"])
 

@@ -229,16 +229,73 @@ def with_bkk(t):
     return t if re.search(r"กรุงเทพ|bangkok|สนามบิน|airport", t, re.I) else t + " กรุงเทพ"
 
 
+@st.cache_resource
+def _geo_store():
+    return {"cache": {}, "off_until": 0}
+
+
+def _geo_longdo(name):
+    """ค้นพิกัดด้วย Longdo Map Search (ใช้คีย์ Longdo ที่มีอยู่ ไม่ต้องผูกบัตร) เน้นโซนกรุงเทพ"""
+    r = requests.get("https://search.longdo.com/mapsearch/json/search", timeout=(4, 8),
+                     params={"keyword": name, "lon": 100.5018, "lat": 13.7563, "span": "60km",
+                             "limit": 3, "key": KEY}).json()
+    for it in (r.get("data") or []) if isinstance(r, dict) else []:
+        try:
+            return {"lat": float(it["lat"]), "lng": float(it["lon"])}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+def _geo_google(name, store):
+    """สำรอง: Places API (New) Text Search (ต้องเปิด API นี้ในโปรเจกต์ Google Cloud) ใช้ไม่ได้คืน None"""
+    try:
+        r = requests.post("https://places.googleapis.com/v1/places:searchText", timeout=(4, 8),
+                          headers={"X-Goog-Api-Key": GKEY, "X-Goog-FieldMask": "places.displayName,places.location"},
+                          json={"textQuery": with_bkk(name), "languageCode": "th", "regionCode": "TH", "pageSize": 1,
+                                "locationBias": {"circle": {"center": {"latitude": 13.7563, "longitude": 100.5018},
+                                                            "radius": 50000.0}}}).json()
+    except Exception as e:
+        print(f"[geocode-google] {name}: {e}", flush=True)
+        store["off_until"] = time.time() + 300
+        return None
+    if "error" in r:
+        print(f"[geocode-google] ใช้ไม่ได้: {r['error'].get('message')}", flush=True)
+        store["off_until"] = time.time() + 600
+        return None
+    loc = ((r.get("places") or [{}])[0]).get("location")
+    return {"lat": loc["latitude"], "lng": loc["longitude"]} if loc else None
+
+
+def geocode(name, store):
+    """หาพิกัดสถานที่: Longdo ก่อน แล้วสำรองด้วย Google Places -> {"lat","lng"} หรือ None (ไม่แคชผลที่หาไม่เจอ)"""
+    k = name.strip().lower()
+    if k in store["cache"]:
+        return store["cache"][k]
+    out = None
+    if KEY and time.time() >= store.get("ld_off", 0):
+        try:
+            out = _geo_longdo(name)
+        except Exception as e:
+            print(f"[geocode-longdo] {name}: {e}", flush=True)
+            store["ld_off"] = time.time() + 300
+    if not out and GKEY and time.time() >= store["off_until"]:
+        out = _geo_google(name, store)
+    if out:
+        store["cache"][k] = out
+    return out
+
+
 _CACHE = {}
 
-def g_route(origin, dest, mode, gkey):
+def g_route(origin, dest, mode, gkey, geo=None):
     k = (origin, dest, mode)
     hit = _CACHE.get(k)
     if hit and time.time() - hit[0] < 600:
         return hit[1]
     t0 = time.time()
     print(f"[g_route] เริ่ม {mode}: {origin} -> {dest}", flush=True)
-    res = _g_route(origin, dest, mode, gkey)
+    res = _g_route(origin, dest, mode, gkey, geo)
     note = res["error"] if isinstance(res, dict) and "error" in res else ("ไม่พบเส้นทาง" if res is None else "OK")
     print(f"[g_route] จบ {mode}: {origin} -> {dest} ใช้ {time.time() - t0:.1f}s ผล: {note}", flush=True)
     if not (isinstance(res, dict) and "error" in res):   # ไม่แคชผลที่ error
@@ -246,8 +303,10 @@ def g_route(origin, dest, mode, gkey):
     return res
 
 
-def _g_route(origin, dest, mode, gkey):
-    body = {"origin": {"address": with_bkk(origin)}, "destination": {"address": with_bkk(dest)},
+def _g_route(origin, dest, mode, gkey, geo=None):
+    wp = lambda t: ({"location": {"latLng": {"latitude": geo[t]["lat"], "longitude": geo[t]["lng"]}}}
+                    if geo and geo.get(t) else {"address": with_bkk(t)})   # มีพิกัดใช้พิกัด ไม่มีใช้ชื่อเหมือนเดิม
+    body = {"origin": wp(origin), "destination": wp(dest),
             "travelMode": "TRANSIT" if mode in ("RAIL", "SRT") else mode, "languageCode": "th", "regionCode": "TH"}
     if mode == "TRANSIT":
         # เพิ่ม BUS เพื่อให้ได้ช่วงรถเมล์ด้วย (ไม่งั้น Gemini ไม่มีอะไรให้ประมาณราคา)
@@ -615,9 +674,15 @@ def plan_trip(stops):
         return "ต้องมีอย่างน้อย 2 จุด (ต้นทางและปลายทาง)"
     stops = stops[:MAX_STOPS]
     print(f"[plan_trip] เริ่มวางแผน {stops}", flush=True)
+    gstore = _geo_store()
+    with ThreadPoolExecutor(max_workers=4) as gx:
+        geo = dict(zip(stops, gx.map(lambda x: geocode(x, gstore), stops)))
+    no_geo = [x for x in stops if not geo.get(x)]
+    pt = lambda nm, fb: ({"lon": geo[nm]["lng"], "lat": geo[nm]["lat"]} if geo.get(nm) else
+                         ({"lon": fb["longitude"], "lat": fb["latitude"]} if fb else None))
     pairs = [(stops[i], stops[i + 1], m) for i in range(len(stops) - 1) for m in ("DRIVE", "TRANSIT", "RAIL", "SRT", "WALK")]
     ex = ThreadPoolExecutor(max_workers=8)
-    futs = {k: ex.submit(g_route, k[0], k[1], k[2], GKEY) for k in pairs}
+    futs = {k: ex.submit(g_route, k[0], k[1], k[2], GKEY, geo) for k in pairs}
     wait(list(futs.values()), timeout=45)            # รอรวมไม่เกิน 45 วินาที
     ex.shutdown(wait=False)                          # ไม่รอ thread ที่ค้าง
     res = {}
@@ -634,18 +699,22 @@ def plan_trip(stops):
     if ss.get("ai_err"):
         out.append(f"⚠️ ขอราคาประมาณจาก Gemini ไม่สำเร็จ ({ss.ai_err}) จึงยังไม่แสดงราคาบางช่วง "
                    "ตรวจ GEMINI_MODEL / คีย์ ในไฟล์ .env แล้วกด \"ทดสอบเรียก Gemini\"\n")
+    if no_geo:
+        out.append(f"⚠️ หาพิกัดของ {', '.join(no_geo)} ไม่ได้ จึงใช้ชื่อค้นหาแทน ตำแหน่งหมุดอาจคลาดเคลื่อน "
+                   "(ลองระบุชื่อสถานที่ให้ชัดขึ้น หรือตรวจคีย์ LONGDO_API_KEY)\n")
     tot_km = tot_min = tot_tr = tot_moto = tot_taxi = 0
     any_ai = False
+    marked = set()
     for i in range(len(stops) - 1):
         leg = plan_leg(stops[i], stops[i + 1], res, ai)
         if "error" in leg:
             out.append(f"### ช่วงที่ {i+1}: {stops[i]} → {stops[i+1]}\n❌ {leg['error']}\n")
             continue
         s0, s1 = leg["start"], leg["end"]
-        if not ss.markers and s0:
-            ss.markers.append({"n": 1, "name": leg["o"], "lon": s0["longitude"], "lat": s0["latitude"]})
-        if s1:
-            ss.markers.append({"n": len(ss.markers) + 1, "name": leg["d"], "lon": s1["longitude"], "lat": s1["latitude"]})
+        for idx, nm, fb in ((i, leg["o"], s0), (i + 1, leg["d"], s1)):   # เลขหมุด = ลำดับจุดแวะจริง
+            p = pt(nm, fb)
+            if idx not in marked and p:
+                ss.markers.append({"n": idx + 1, "name": nm, **p}); marked.add(idx)
         ss.legs.append(leg); ss.stations += leg["stations"]
         for st_ in leg["srt_stations"]:              # สถานีรถไฟไทยแสดงบนแผนที่ด้วย
             if st_ not in ss.stations:
